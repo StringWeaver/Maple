@@ -83,12 +83,28 @@ Build steps:
 
 1. **Recursively** clone this repository.
 2. Open a PowerShell Prompt.
-3. Change working directory to `leaf`.
-4. `cargo build -p leaf-ffi -Z build-std=std,panic_abort --target x86_64-uwp-windows-msvc`.  
+3. Install Rust nightly toolchain and required components:
+   ```powershell
+   rustup install nightly-x86_64-pc-windows-msvc
+   rustup component add rust-src --toolchain nightly-x86_64-pc-windows-msvc
+   ```
+4. Change working directory to `leaf`.
+5. Update dependencies for nightly compatibility:
+   ```powershell
+   cargo update -p ahash
+   cargo update -p time
+   ```
+6. Build Leaf FFI:
+   ```powershell
+   cargo build -p leaf-ffi -Z build-std=std,panic_abort --target x86_64-uwp-windows-msvc
+   ```
    For Release builds, use `cargo build -p leaf-ffi -Z build-std=std,panic_abort --target x86_64-uwp-windows-msvc --release`.  
    See also https://github.com/eycorsican/leaf#build .
-5. Change working directory to `Maple.App\MonacoEditor`.
-6. Build Monaco editor and language support: `npm install && npm run build`.
-7. Open `Maple.sln` in Visual Studio.
-8. Build Solution.
-
+7. Change working directory to `Maple.App\MonacoEditor`.
+8. Build Monaco editor and language support:
+   ```powershell
+   npm install
+   npm run build
+   ```
+9. Open `Maple.sln` in Visual Studio.
+10. Build Solution.

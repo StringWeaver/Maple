@@ -11,39 +11,32 @@ extern "C" void* lwip_strerr(uint8_t) {
 
 namespace winrt::Maple_Task::implementation
 {
+    winrt::com_ptr<VpnPlugin> VpnPluginInstance = winrt::make_self<VpnPlugin>();
+
     using Windows::Networking::HostName;
     using Windows::Networking::Sockets::DatagramSocket;
-    using Windows::Storage::Streams::IOutputStream;
     using namespace Windows::Networking::Vpn;
     using namespace Windows::Storage;
     using namespace Windows::Storage::AccessCache;
 
     extern "C" {
         typedef void(__cdecl* netstack_cb)(uint8_t*, size_t, void*);
-        void cb(uint8_t* data, size_t size, void* outputStreamAbi) {
-            bool needSendDummyBuffer = false;
-            {
-                std::lock_guard _guard{ VpnPluginInstance->m_decapQueueLock };
-                auto& q = VpnPluginInstance->m_decapQueue;
-                {
-                    std::vector<uint8_t> buf(size);
-                    if (memcpy_s(buf.data(), buf.capacity(), data, size)) {
-                        return;
-                    }
-                    needSendDummyBuffer = q.empty();
-                    q.emplace(buf);
+        void cb(uint8_t* data, size_t size, void* channelAbi) {
+            // Directly inject received packet into VpnChannel,
+            // bypassing the old dummy-buffer/loopback-socket mechanism.
+            VpnChannel channel{ nullptr };
+            winrt::attach_abi(channel, channelAbi);
+            try {
+                const auto outBuffer = channel.GetVpnReceivePacketBuffer();
+                const auto outBuf = outBuffer.Buffer();
+                if (memcpy_s(outBuf.data(), outBuf.Capacity(), data, size) == 0) {
+                    outBuf.Length(static_cast<uint32_t>(size));
+                    channel.AppendVpnReceivePacketBuffer(outBuffer);
+                    channel.FlushVpnReceivePacketBuffers();
                 }
             }
-            if (!needSendDummyBuffer) {
-                return;
-            }
-            IOutputStream outputStream{ nullptr };
-            winrt::attach_abi(outputStream, outputStreamAbi);
-            try {
-                const auto _ = outputStream.WriteAsync(dummyBuffer);
-            }
             catch (...) {}
-            winrt::detach_abi(outputStream);
+            winrt::detach_abi(channel);
         }
     }
     void VpnPlugin::Connect(VpnChannel const& channel)
@@ -61,12 +54,11 @@ namespace winrt::Maple_Task::implementation
     void VpnPlugin::ConnectCore(VpnChannel const& channel)
     {
         const auto localhost = HostName{ L"127.0.0.1" };
-        DatagramSocket transport{}, backTransport{};
+        DatagramSocket transport{};
         channel.AssociateTransport(transport, nullptr);
         transport.BindEndpointAsync(localhost, L"").get();
-        backTransport.BindEndpointAsync(localhost, L"").get();
-        transport.ConnectAsync(localhost, backTransport.Information().LocalPort()).get();
-        backTransport.ConnectAsync(localhost, transport.Information().LocalPort()).get();
+        // Connect transport to itself so StartWithMainTransport sees a connected socket
+        transport.ConnectAsync(localhost, transport.Information().LocalPort()).get();
 
         VpnRouteAssignment routeScope{};
         routeScope.ExcludeLocalSubnets(true);
@@ -85,18 +77,15 @@ namespace winrt::Maple_Task::implementation
         //     VpnRoute(HostName{ L"172.25.0.0" }, 16)
         // });
 
-        const auto outputStreamAbi = winrt::detach_abi(backTransport.OutputStream());
         StopLeaf();
-        {
-            std::lock_guard _guard{ m_decapQueueLock };
-            while (!m_decapQueue.empty()) {
-                m_decapQueue.pop();
-            }
-        }
-        m_backTransport = backTransport;
+        m_channel = channel;
 
-        m_netStackHandle = netstack_register(cb, outputStreamAbi);
+        // Pass VpnChannel ABI as context to netstack callback
+        const auto channelAbi = winrt::detach_abi(m_channel);
+        m_netStackHandle = netstack_register(cb, channelAbi);
         if (m_netStackHandle == nullptr) {
+            // Re-attach to avoid leaking the ABI reference
+            winrt::attach_abi(m_channel, channelAbi);
             channel.TerminateConnection(L"Error initializing Leaf netstack.");
             return;
         }
@@ -177,7 +166,7 @@ namespace winrt::Maple_Task::implementation
         );
     }
     void VpnPlugin::StopLeaf() {
-        m_backTransport = nullptr;
+        m_channel = nullptr;
 
         auto leafHandle = m_leaf;
         if (leafHandle != nullptr) {
@@ -189,7 +178,7 @@ namespace winrt::Maple_Task::implementation
         if (netStackHandle != nullptr) {
             const auto context = netstack_release(netStackHandle);
             m_netStackHandle = nullptr;
-            // Release context, which is an ABI of IOutputStream
+            // Release context, which is an ABI of VpnChannel
             IInspectable obj{};
             winrt::attach_abi(obj, context);
             m_netStackHandle = nullptr;
@@ -216,21 +205,10 @@ namespace winrt::Maple_Task::implementation
             packets.Append(packet);
         }
     }
-    void VpnPlugin::Decapsulate(VpnChannel const& channel, [[maybe_unused]] VpnPacketBuffer const& encapBuffer, VpnPacketBufferList const& decapsulatedPackets, VpnPacketBufferList const&)
+    void VpnPlugin::Decapsulate(VpnChannel const&, VpnPacketBuffer const&, VpnPacketBufferList const&, VpnPacketBufferList const&)
     {
-        std::lock_guard _guard{ VpnPluginInstance->m_decapQueueLock };
-        auto& q = VpnPluginInstance->m_decapQueue;
-        while (!q.empty()) {
-            auto&& incomingBuffer = q.front();
-            const auto outBuffer = channel.GetVpnReceivePacketBuffer();
-            decapsulatedPackets.Append(outBuffer);
-            const auto outBuf = outBuffer.Buffer();
-            const auto size = incomingBuffer.size();
-            if (memcpy_s(outBuf.data(), outBuf.Capacity(), incomingBuffer.data(), size)) {
-                return;
-            }
-            outBuf.Length(static_cast<uint32_t>(size));
-            q.pop();
-        }
+        // Inbound packets are now injected directly via cb() using
+        // GetVpnReceivePacketBuffer + AppendVpnReceivePacketBuffer + FlushVpnReceivePacketBuffers.
+        // Decapsulate is no longer the entry point for inbound data.
     }
 }
